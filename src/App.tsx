@@ -108,7 +108,6 @@ export default function App(){
       const uid = data.uid
       setLastScannedUID(uid)
       append(`[CARD] Scanned ${uid} (use in any field)`)
-      // Optional: auto-fill based on route if desired
       if (route === '#borrow' && borrowCardRef.current) {
         borrowCardRef.current.value = uid
         append(`[CARD→Borrow] ${uid}`)
@@ -116,8 +115,6 @@ export default function App(){
         returnCardRef.current.value = uid
         append(`[CARD→Return] ${uid}`)
         loadLoansForReturn()
-      } else if (route === '#manage-students') {
-        // For manage, since multiple fields, rely on last scanned
       }
     } else if(evt === 'item'){
       if (route === '#borrow' && borrowItemTagRef.current) {
@@ -158,31 +155,31 @@ export default function App(){
   }
 
   async function trySync(background: boolean) {
-  const uns = await db.transactions.where('synced').notEqual(1).toArray();
-  if (uns.length === 0) {
-    if (!background) append('No unsynced transactions.');
-    return;
-  }
-  const ok = await fetch((import.meta.env.VITE_SUPABASE_URL || '') + '/status')
-    .then(r => r.ok)
-    .catch(() => false);
-  if (!ok) {
-    if (!background) append('Offline.');
-    return;
-  }
-  try {
-    const { ok: syncOk, error, data } = await upsertTransactions(uns);
-    if (syncOk) {
-      await db.transactions.bulkPut(uns.map(r => ({ ...r, synced: 1 })));
-      append(`Synced ${uns.length} transactions.`);
-      refresh();
-    } else {
-      append(`Sync failed: ${error || 'Unknown error'}`);
+    const uns = await db.transactions.where('synced').notEqual(1).toArray();
+    if (uns.length === 0) {
+      if (!background) append('No unsynced transactions.');
+      return;
     }
-  } catch (e) {
-    append(`Sync failed: ${String(e)}`);
+    const ok = await fetch((import.meta.env.VITE_SUPABASE_URL || '') + '/status')
+      .then(r => r.ok)
+      .catch(() => false);
+    if (!ok) {
+      if (!background) append('Offline.');
+      return;
+    }
+    try {
+      const { ok: syncOk, error } = await upsertTransactions(uns);
+      if (syncOk) {
+        await db.transactions.bulkPut(uns.map(r => ({ ...r, synced: 1 })));
+        append(`Synced ${uns.length} transactions.`);
+        refresh();
+      } else {
+        append(`Sync failed: ${error || 'Unknown error'}`);
+      }
+    } catch (e) {
+      append(`Sync failed: ${String(e)}`);
+    }
   }
-}
 
   // ===== Borrow flow =====
   async function submitBorrow(){
@@ -352,15 +349,36 @@ export default function App(){
 
       <div className="content">
         {route === '#borrow' ? (
-          <BorrowView refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }} onSubmit={submitBorrow} lastScannedUID={lastScannedUID} setLastScannedUID={setLastScannedUID} />
+          <BorrowView
+            refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }}
+            onSubmit={submitBorrow}
+            lastScannedUID={lastScannedUID}
+            setLastScannedUID={setLastScannedUID}
+          />
         ) : route === '#return' ? (
-          <ReturnView refs={{ returnCardRef, returnIndexRef }} loans={loans} loadLoans={loadLoansForReturn} onReturn={markReturned} lastScannedUID={lastScannedUID} setLastScannedUID={setLastScannedUID} />
+          <ReturnView
+            refs={{ returnCardRef, returnIndexRef }}
+            loans={loans}
+            loadLoans={loadLoansForReturn}
+            onReturn={markReturned}
+            lastScannedUID={lastScannedUID}
+            setLastScannedUID={setLastScannedUID}
+          />
         ) : route === '#students' ? (
           <StudentsView list={filtStudents} stQuery={stQuery} setStQuery={setStQuery} />
         ) : route === '#transactions' ? (
           <TransactionsView list={filtTx} txQuery={txQuery} setTxQuery={setTxQuery} />
         ) : route === '#manage-students' ? (
-          <ManageStudentsView students={students} setStudents={setStudents} refresh={refresh} append={append} lastScannedUID={lastScannedUID} setLastScannedUID={setLastScannedUID} manageAddCardRef={manageAddCardRef} manageEditCardRef={manageEditCardRef} />
+          <ManageStudentsView
+            students={students}
+            setStudents={setStudents}
+            refresh={refresh}
+            append={append}
+            lastScannedUID={lastScannedUID}
+            setLastScannedUID={setLastScannedUID}
+            manageAddCardRef={manageAddCardRef}
+            manageEditCardRef={manageEditCardRef}
+          />
         ) : route === '#settings' ? (
           <SettingsView sendSerialCommand={sendSerialCommand} connected={connected} />
         ) : (
@@ -438,7 +456,17 @@ function DashboardView({log, alerts, onRefreshAlerts, logBoxRef, sendSerialComma
   </>
 }
 
-function BorrowView({refs, onSubmit, lastScannedUID}:{refs:any; onSubmit:()=>void; lastScannedUID: string}){
+function BorrowView({
+  refs,
+  onSubmit,
+  lastScannedUID,
+  setLastScannedUID
+}: {
+  refs: any
+  onSubmit: () => Promise<void>
+  lastScannedUID: string
+  setLastScannedUID: React.Dispatch<React.SetStateAction<string>>
+}){
   return <div style={{maxWidth:860}}>
     <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Borrow</div>
     <p className="notice">Scan card (or enter manually), then enter book details and duration. Students may hold up to <b>3</b> active loans.</p>
@@ -466,7 +494,21 @@ function BorrowView({refs, onSubmit, lastScannedUID}:{refs:any; onSubmit:()=>voi
   </div>
 }
 
-function ReturnView({refs, loans, loadLoans, onReturn, lastScannedUID}:{refs:any; loans:Loan[]; loadLoans:()=>void; onReturn:(l:Loan)=>void; lastScannedUID: string}){
+function ReturnView({
+  refs,
+  loans,
+  loadLoans,
+  onReturn,
+  lastScannedUID,
+  setLastScannedUID
+}: {
+  refs: any
+  loans: Loan[]
+  loadLoans: () => Promise<void>
+  onReturn: (l: Loan) => Promise<void>
+  lastScannedUID: string
+  setLastScannedUID: React.Dispatch<React.SetStateAction<string>>
+}){
   return <div style={{maxWidth:960}}>
     <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Return</div>
     <p className="notice">Scan card (or enter index) to list active loans for that student, then mark the returned item.</p>
@@ -551,7 +593,25 @@ function TransactionsView({list, txQuery, setTxQuery}:{list:Tx[]; txQuery:string
   </div>
 }
 
-function ManageStudentsView({students, setStudents, refresh, append, lastScannedUID, manageAddCardRef, manageEditCardRef}:{students:Student[]; setStudents:(students:Student[])=>void; refresh:()=>void; append:(s:string)=>void; lastScannedUID: string; manageAddCardRef: React.RefObject<HTMLInputElement>; manageEditCardRef: React.RefObject<HTMLInputElement>}){
+function ManageStudentsView({
+  students,
+  setStudents,
+  refresh,
+  append,
+  lastScannedUID,
+  setLastScannedUID,
+  manageAddCardRef,
+  manageEditCardRef
+}: {
+  students: Student[]
+  setStudents: React.Dispatch<React.SetStateAction<Student[]>>
+  refresh: () => Promise<void>
+  append: (s: string) => void
+  lastScannedUID: string
+  setLastScannedUID: React.Dispatch<React.SetStateAction<string>>
+  manageAddCardRef: React.RefObject<HTMLInputElement>
+  manageEditCardRef: React.RefObject<HTMLInputElement>
+}){
   const [newStudent, setNewStudent] = useState<Partial<Student>>({})
   const [editStudent, setEditStudent] = useState<Student | null>(null)
 
@@ -572,9 +632,9 @@ function ManageStudentsView({students, setStudents, refresh, append, lastScanned
       created_at: now
     }
     const id = await db.students.add(student)
-    setStudents([...students, {...student, id}])
+    setStudents(prev => [...prev, {...student, id}])
     setNewStudent({})
-    refresh()
+    await refresh()
     append(`[ADD STUDENT] ${student.index_number}`)
   }
 
@@ -582,17 +642,17 @@ function ManageStudentsView({students, setStudents, refresh, append, lastScanned
     e.preventDefault()
     if(!editStudent) return
     await db.students.put(editStudent)
-    setStudents(students.map(s => s.id === editStudent.id ? editStudent : s))
+    setStudents(prev => prev.map(s => s.id === editStudent.id ? editStudent : s))
     setEditStudent(null)
-    refresh()
+    await refresh()
     append(`[UPDATE STUDENT] ${editStudent.index_number}`)
   }
 
   async function handleDeleteStudent(id: number){
     if(!confirm('Delete this student?')) return
     await db.students.delete(id)
-    setStudents(students.filter(s => s.id !== id))
-    refresh()
+    setStudents(prev => prev.filter(s => s.id !== id))
+    await refresh()
     append(`[DELETE STUDENT] ID ${id}`)
   }
 
@@ -669,6 +729,5 @@ function SettingsView({sendSerialCommand, connected}:{sendSerialCommand:(cmd:str
       <br/>• <code>VITE_ADMIN_USER</code>, <code>VITE_ADMIN_PASS</code> (optional admin login)
     </p>
     <p className="notice">Works fully with manual input if no hardware is connected. Use <b>Connect Reader</b> for Web Serial.</p>
-    {/* Removed toggle as per request */}
   </div>
 }
