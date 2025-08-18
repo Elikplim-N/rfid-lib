@@ -41,15 +41,15 @@ class DB extends Dexie {
   students!: Table<Student, number>
   loans!: Table<Loan, string>
 
-  constructor(){
+  constructor() {
     super('library_web')
-    // v1 existed (transactions, students). v2 adds loans.
+    // v1 existed (transactions, students). v2 adds loans and indexes action.
     this.version(1).stores({
-      transactions: 'id, synced, occurred_at',
+      transactions: 'id, synced, occurred_at', // Initial schema
       students: '++id, index_number, card_uid, created_at'
     })
     this.version(2).stores({
-      transactions: 'id, synced, occurred_at',
+      transactions: 'id, synced, occurred_at, action', // Added 'action' index
       students: '++id, index_number, card_uid, created_at',
       loans: 'id, status, due_at, student_index, user_uid, item_tag'
     })
@@ -58,17 +58,17 @@ class DB extends Dexie {
 
 export const db = new DB()
 
-export async function stats(){
+export async function stats() {
   const total = await db.transactions.count()
-  const todayStr = new Date().toISOString().slice(0,10)
+  const todayStr = new Date().toISOString().slice(0, 10)
   const today = await db.transactions.where('occurred_at').between(todayStr, todayStr + '\uFFFF').count()
   const unsynced = await db.transactions.where('synced').notEqual(1).count()
-  const borrowed = await db.transactions.where('action').equals('BORROW').count()
-  const returned = await db.transactions.where('action').equals('RETURN').count()
+  const borrowed = await db.transactions.where('action').equals('BORROW').count() // Uses indexed 'action'
+  const returned = await db.transactions.where('action').equals('RETURN').count() // Uses indexed 'action'
   return { total, today, unsynced, borrowed, returned }
 }
 
-export async function activeLoansForStudent(indexOrUid: {index_number?: string; card_uid?: string}) {
+export async function activeLoansForStudent(indexOrUid: { index_number?: string; card_uid?: string }) {
   let idx: string | null = null
   if (indexOrUid.index_number) {
     idx = indexOrUid.index_number

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { stats, db, Tx, Student, Loan, addDays, activeLoansForStudent, countActiveLoans } from './lib/db'
-import { requestPort, readJsonLines } from './lib/serial'
+import { requestPort, readLines } from './lib/serial'
 import { upsertTransactions } from './lib/supabase'
 
 const BLUE = '#166FE5'
@@ -50,6 +50,8 @@ export default function App(){
   const [connected, setConnected] = useState(false)           // real/serial port
   const [manualConnected, setManualConnected] = useState(false) // manual admin toggle
   const [autosync, setAutosync] = useState(true)
+  const [port, setPort] = useState<any>(null)
+  const [lastScannedUID, setLastScannedUID] = useState<string>('')
 
   // Borrow/Return inputs
   const borrowCardRef = useRef<HTMLInputElement>(null)
@@ -60,6 +62,9 @@ export default function App(){
 
   const returnCardRef = useRef<HTMLInputElement>(null)
   const returnIndexRef = useRef<HTMLInputElement>(null)
+
+  const manageAddCardRef = useRef<HTMLInputElement>(null)
+  const manageEditCardRef = useRef<HTMLInputElement>(null)
 
   const { total, today, unsynced, refresh } = useBadges()
   const [students, setStudents] = useState<Student[]>([])
@@ -96,19 +101,23 @@ export default function App(){
     }, 0)
   }
 
-  // Serial → route-aware inputs
+  // Serial → route-aware inputs + last scanned
   function handleEvent(data:any){
     const evt = data?.event
     if(evt === 'card'){
+      const uid = data.uid
+      setLastScannedUID(uid)
+      append(`[CARD] Scanned ${uid} (use in any field)`)
+      // Optional: auto-fill based on route if desired
       if (route === '#borrow' && borrowCardRef.current) {
-        borrowCardRef.current.value = data.uid
-        append(`[CARD→Borrow] ${data.uid}`)
+        borrowCardRef.current.value = uid
+        append(`[CARD→Borrow] ${uid}`)
       } else if (route === '#return' && returnCardRef.current) {
-        returnCardRef.current.value = data.uid
-        append(`[CARD→Return] ${data.uid}`)
+        returnCardRef.current.value = uid
+        append(`[CARD→Return] ${uid}`)
         loadLoansForReturn()
-      } else {
-        append(`[CARD] ${data.uid}`)
+      } else if (route === '#manage-students') {
+        // For manage, since multiple fields, rely on last scanned
       }
     } else if(evt === 'item'){
       if (route === '#borrow' && borrowItemTagRef.current) {
@@ -121,33 +130,59 @@ export default function App(){
   }
 
   async function connectSerial(){
-    const port = await requestPort()
-    if(!port){ append('Serial not available or cancelled.'); return }
+    const p = await requestPort()
+    if(!p){ append('Serial not available or cancelled.'); return }
+    setPort(p)
     setConnected(true)
     append('Connected to reader.')
-    readJsonLines(port, handleEvent, ()=>{
+    readLines(p, handleEvent, ()=>{
       append('Port closed.')
       setConnected(false)
+      setPort(null)
     })
   }
 
-  async function trySync(background:boolean){
-    const uns = await db.transactions.where('synced').notEqual(1).toArray()
-    if(uns.length === 0){
-      if(!background) append('No unsynced transactions.')
+  async function sendSerialCommand(cmd: string){
+    if(!port || !connected){
+      append('Not connected to device.')
       return
     }
-    const ok = await fetch((import.meta.env.VITE_SUPABASE_URL||'') + '/status').then(r=>r.ok).catch(()=>false)
-    if(!ok){ if(!background) append('Offline.'); return }
-    const { ok:ok2, error } = await upsertTransactions(uns)
-    if(ok2){
-      await db.transactions.bulkPut(uns.map(r=>({...r, synced:1})))
-      append(`Synced ${uns.length} transactions.`)
-      refresh()
-    }else{
-      append(`Sync failed: ${error}`)
+    try{
+      const writer = port.writable.getWriter()
+      await writer.write(new TextEncoder().encode(cmd + '\n'))
+      writer.releaseLock()
+      append(`Sent command: ${cmd}`)
+    }catch(e){
+      append(`Write error: ${e}`)
     }
   }
+
+  async function trySync(background: boolean) {
+  const uns = await db.transactions.where('synced').notEqual(1).toArray();
+  if (uns.length === 0) {
+    if (!background) append('No unsynced transactions.');
+    return;
+  }
+  const ok = await fetch((import.meta.env.VITE_SUPABASE_URL || '') + '/status')
+    .then(r => r.ok)
+    .catch(() => false);
+  if (!ok) {
+    if (!background) append('Offline.');
+    return;
+  }
+  try {
+    const { ok: syncOk, error, data } = await upsertTransactions(uns);
+    if (syncOk) {
+      await db.transactions.bulkPut(uns.map(r => ({ ...r, synced: 1 })));
+      append(`Synced ${uns.length} transactions.`);
+      refresh();
+    } else {
+      append(`Sync failed: ${error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    append(`Sync failed: ${String(e)}`);
+  }
+}
 
   // ===== Borrow flow =====
   async function submitBorrow(){
@@ -311,22 +346,25 @@ export default function App(){
         <button className="navbtn" onClick={()=> setRoute('#return')}>📤 Return</button>
         <button className="navbtn" onClick={()=> setRoute('#transactions')}>🧾 Transactions</button>
         <button className="navbtn" onClick={()=> setRoute('#students')}>👥 Students</button>
+        <button className="navbtn" onClick={()=> setRoute('#manage-students')}>👤 Manage Students</button>
         <button className="navbtn" onClick={()=> setRoute('#settings')}>⚙️ Settings</button>
       </div>
 
       <div className="content">
         {route === '#borrow' ? (
-          <BorrowView refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }} onSubmit={submitBorrow} />
+          <BorrowView refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }} onSubmit={submitBorrow} lastScannedUID={lastScannedUID} setLastScannedUID={setLastScannedUID} />
         ) : route === '#return' ? (
-          <ReturnView refs={{ returnCardRef, returnIndexRef }} loans={loans} loadLoans={loadLoansForReturn} onReturn={markReturned} />
+          <ReturnView refs={{ returnCardRef, returnIndexRef }} loans={loans} loadLoans={loadLoansForReturn} onReturn={markReturned} lastScannedUID={lastScannedUID} setLastScannedUID={setLastScannedUID} />
         ) : route === '#students' ? (
           <StudentsView list={filtStudents} stQuery={stQuery} setStQuery={setStQuery} />
         ) : route === '#transactions' ? (
           <TransactionsView list={filtTx} txQuery={txQuery} setTxQuery={setTxQuery} />
+        ) : route === '#manage-students' ? (
+          <ManageStudentsView students={students} setStudents={setStudents} refresh={refresh} append={append} lastScannedUID={lastScannedUID} setLastScannedUID={setLastScannedUID} manageAddCardRef={manageAddCardRef} manageEditCardRef={manageEditCardRef} />
         ) : route === '#settings' ? (
-          <SettingsView/>
+          <SettingsView sendSerialCommand={sendSerialCommand} connected={connected} />
         ) : (
-          <DashboardView log={log} alerts={alerts} onRefreshAlerts={refreshAlerts} logBoxRef={logBoxRef} />
+          <DashboardView log={log} alerts={alerts} onRefreshAlerts={refreshAlerts} logBoxRef={logBoxRef} sendSerialCommand={sendSerialCommand} connected={connected} />
         )}
       </div>
     </div>
@@ -335,10 +373,25 @@ export default function App(){
 
 // ---------- Views ----------
 
-function DashboardView({log, alerts, onRefreshAlerts, logBoxRef}:{log:string; alerts:Loan[]; onRefreshAlerts:()=>void; logBoxRef:React.RefObject<HTMLDivElement>}){
+function DashboardView({log, alerts, onRefreshAlerts, logBoxRef, sendSerialCommand, connected}:{log:string; alerts:Loan[]; onRefreshAlerts:()=>void; logBoxRef:React.RefObject<HTMLDivElement>; sendSerialCommand:(cmd:string)=>void; connected:boolean}){
   const [s, setS] = useState({total:0,today:0,unsynced:0,borrowed:0,returned:0})
   useEffect(()=>{ stats().then(setS) }, [log])
   useEffect(()=>{ onRefreshAlerts() }, [log])
+
+  async function sendReminder(loan: Loan){
+    const student = await db.students.where('index_number').equals(loan.student_index || '').first()
+    if(!student){
+      alert('Student not found.')
+      return
+    }
+    if(!student.phone){
+      alert('No phone number for this student.')
+      return
+    }
+    const overdue = new Date(loan.due_at) < new Date()
+    const message = `Library Reminder: Your item "${loan.item_title ?? loan.item_tag}" is ${overdue ? 'overdue' : 'due soon'} (due: ${loan.due_at.slice(0,10)}). Please return it promptly.`
+    sendSerialCommand(`SEND_SMS|${student.phone}|${message}`)
+  }
 
   return <>
     <div className="cards">
@@ -362,7 +415,7 @@ function DashboardView({log, alerts, onRefreshAlerts, logBoxRef}:{log:string; al
         <div style={{fontWeight:600, marginBottom:6}}>Due Soon / Overdue</div>
         <table className="table">
           <thead><tr>
-            <th>Student</th><th>Book</th><th>Due</th><th>Status</th>
+            <th>Student</th><th>Book</th><th>Due</th><th>Status</th><th>Action</th>
           </tr></thead>
           <tbody>
             {alerts.map(l=>{
@@ -373,10 +426,11 @@ function DashboardView({log, alerts, onRefreshAlerts, logBoxRef}:{log:string; al
                   <td>{l.item_title ?? l.item_tag}</td>
                   <td>{l.due_at.slice(0,19).replace('T',' ')}</td>
                   <td style={{color: overdue ? '#DC2626' : '#B45309'}}>{overdue ? 'Overdue' : 'Due soon'}</td>
+                  <td><button className="btn primary" disabled={!connected} onClick={()=>sendReminder(l)}>Send Reminder SMS</button></td>
                 </tr>
               )
             })}
-            {alerts.length===0 && <tr><td colSpan={4} className="notice">No upcoming or overdue items.</td></tr>}
+            {alerts.length===0 && <tr><td colSpan={5} className="notice">No upcoming or overdue items.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -384,14 +438,17 @@ function DashboardView({log, alerts, onRefreshAlerts, logBoxRef}:{log:string; al
   </>
 }
 
-function BorrowView({refs, onSubmit}:{refs:any; onSubmit:()=>void}){
+function BorrowView({refs, onSubmit, lastScannedUID}:{refs:any; onSubmit:()=>void; lastScannedUID: string}){
   return <div style={{maxWidth:860}}>
     <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Borrow</div>
     <p className="notice">Scan card (or enter manually), then enter book details and duration. Students may hold up to <b>3</b> active loans.</p>
     <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
       <div>
         <div style={{fontWeight:600, marginBottom:4}}>Identity</div>
-        <input ref={refs.borrowCardRef} placeholder="Card UID (scan or type)" className="search" />
+        <div style={{display:'flex', gap:8}}>
+          <input ref={refs.borrowCardRef} placeholder="Card UID (scan or type)" className="search" style={{flex:1}} />
+          <button className="btn" onClick={() => refs.borrowCardRef.current.value = lastScannedUID} disabled={!lastScannedUID}>Use Last Scan</button>
+        </div>
         <div style={{fontSize:12, color:'#64748B', margin:'6px 0'}}>or</div>
         <input ref={refs.borrowIndexRef} placeholder="Student Index" className="search" />
       </div>
@@ -409,12 +466,15 @@ function BorrowView({refs, onSubmit}:{refs:any; onSubmit:()=>void}){
   </div>
 }
 
-function ReturnView({refs, loans, loadLoans, onReturn}:{refs:any; loans:Loan[]; loadLoans:()=>void; onReturn:(l:Loan)=>void}){
+function ReturnView({refs, loans, loadLoans, onReturn, lastScannedUID}:{refs:any; loans:Loan[]; loadLoans:()=>void; onReturn:(l:Loan)=>void; lastScannedUID: string}){
   return <div style={{maxWidth:960}}>
     <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Return</div>
     <p className="notice">Scan card (or enter index) to list active loans for that student, then mark the returned item.</p>
     <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
-      <input ref={refs.returnCardRef} placeholder="Card UID (scan or type)" className="search" />
+      <div style={{display:'flex', gap:8}}>
+        <input ref={refs.returnCardRef} placeholder="Card UID (scan or type)" className="search" style={{flex:1}} />
+        <button className="btn" onClick={() => refs.returnCardRef.current.value = lastScannedUID} disabled={!lastScannedUID}>Use Last Scan</button>
+      </div>
       <input ref={refs.returnIndexRef} placeholder="Student Index (optional)" className="search" />
     </div>
     <div style={{marginTop:10}}>
@@ -491,7 +551,117 @@ function TransactionsView({list, txQuery, setTxQuery}:{list:Tx[]; txQuery:string
   </div>
 }
 
-function SettingsView(){
+function ManageStudentsView({students, setStudents, refresh, append, lastScannedUID, manageAddCardRef, manageEditCardRef}:{students:Student[]; setStudents:(students:Student[])=>void; refresh:()=>void; append:(s:string)=>void; lastScannedUID: string; manageAddCardRef: React.RefObject<HTMLInputElement>; manageEditCardRef: React.RefObject<HTMLInputElement>}){
+  const [newStudent, setNewStudent] = useState<Partial<Student>>({})
+  const [editStudent, setEditStudent] = useState<Student | null>(null)
+
+  async function handleAddStudent(e: React.FormEvent){
+    e.preventDefault()
+    if(!newStudent.index_number || !newStudent.full_name){
+      alert('Index number and full name are required.')
+      return
+    }
+    const now = new Date().toISOString()
+    const student: Student = {
+      index_number: newStudent.index_number,
+      full_name: newStudent.full_name,
+      program: newStudent.program || null,
+      level: newStudent.level || null,
+      phone: newStudent.phone || null,
+      card_uid: newStudent.card_uid || null,
+      created_at: now
+    }
+    const id = await db.students.add(student)
+    setStudents([...students, {...student, id}])
+    setNewStudent({})
+    refresh()
+    append(`[ADD STUDENT] ${student.index_number}`)
+  }
+
+  async function handleUpdateStudent(e: React.FormEvent){
+    e.preventDefault()
+    if(!editStudent) return
+    await db.students.put(editStudent)
+    setStudents(students.map(s => s.id === editStudent.id ? editStudent : s))
+    setEditStudent(null)
+    refresh()
+    append(`[UPDATE STUDENT] ${editStudent.index_number}`)
+  }
+
+  async function handleDeleteStudent(id: number){
+    if(!confirm('Delete this student?')) return
+    await db.students.delete(id)
+    setStudents(students.filter(s => s.id !== id))
+    refresh()
+    append(`[DELETE STUDENT] ID ${id}`)
+  }
+
+  return <div>
+    <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Manage Students</div>
+    <p className="notice">Create, edit, or delete student records. Scan card and use "Use Last Scan" to fill UID without typing.</p>
+    <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(300px,1fr))', gap:16}}>
+      <div>
+        <div style={{fontWeight:600, marginBottom:6}}>Add New Student</div>
+        <form onSubmit={handleAddStudent} style={{display:'grid', gap:8}}>
+          <input className="search" placeholder="Index Number *" value={newStudent.index_number||''} onChange={e=>setNewStudent({...newStudent, index_number:e.target.value})} />
+          <input className="search" placeholder="Full Name *" value={newStudent.full_name||''} onChange={e=>setNewStudent({...newStudent, full_name:e.target.value})} />
+          <input className="search" placeholder="Program" value={newStudent.program||''} onChange={e=>setNewStudent({...newStudent, program:e.target.value})} />
+          <input className="search" placeholder="Level" value={newStudent.level||''} onChange={e=>setNewStudent({...newStudent, level:e.target.value})} />
+          <input className="search" placeholder="Phone" value={newStudent.phone||''} onChange={e=>setNewStudent({...newStudent, phone:e.target.value})} />
+          <div style={{display:'flex', gap:8}}>
+            <input ref={manageAddCardRef} className="search" placeholder="Card UID" value={newStudent.card_uid||''} onChange={e=>setNewStudent({...newStudent, card_uid:e.target.value})} style={{flex:1}} />
+            <button type="button" className="btn" onClick={() => setNewStudent({...newStudent, card_uid: lastScannedUID})} disabled={!lastScannedUID}>Use Last Scan</button>
+          </div>
+          <button className="btn primary">Add</button>
+        </form>
+      </div>
+
+      {editStudent && <div>
+        <div style={{fontWeight:600, marginBottom:6}}>Edit Student</div>
+        <form onSubmit={handleUpdateStudent} style={{display:'grid', gap:8}}>
+          <input className="search" placeholder="Index Number *" value={editStudent.index_number||''} onChange={e=>setEditStudent({...editStudent, index_number:e.target.value})} />
+          <input className="search" placeholder="Full Name *" value={editStudent.full_name||''} onChange={e=>setEditStudent({...editStudent, full_name:e.target.value})} />
+          <input className="search" placeholder="Program" value={editStudent.program||''} onChange={e=>setEditStudent({...editStudent, program:e.target.value})} />
+          <input className="search" placeholder="Level" value={editStudent.level||''} onChange={e=>setEditStudent({...editStudent, level:e.target.value})} />
+          <input className="search" placeholder="Phone" value={editStudent.phone||''} onChange={e=>setEditStudent({...editStudent, phone:e.target.value})} />
+          <div style={{display:'flex', gap:8}}>
+            <input ref={manageEditCardRef} className="search" placeholder="Card UID" value={editStudent.card_uid||''} onChange={e=>setEditStudent({...editStudent, card_uid:e.target.value})} style={{flex:1}} />
+            <button type="button" className="btn" onClick={() => setEditStudent({...editStudent, card_uid: lastScannedUID})} disabled={!lastScannedUID}>Use Last Scan</button>
+          </div>
+          <div style={{display:'flex', gap:8}}>
+            <button className="btn primary">Update</button>
+            <button className="btn" type="button" onClick={()=>setEditStudent(null)}>Cancel</button>
+          </div>
+        </form>
+      </div>}
+    </div>
+    <hr className="sep"/>
+    <div style={{fontWeight:600, marginBottom:6}}>All Students</div>
+    <table className="table">
+      <thead><tr>
+        <th>Index</th><th>Name</th><th>Program</th><th>Level</th><th>Phone</th><th>Card UID</th><th>Created</th><th>Actions</th>
+      </tr></thead>
+      <tbody>
+        {students.map(s=> <tr key={s.id}>
+          <td>{s.index_number}</td>
+          <td>{s.full_name}</td>
+          <td>{s.program}</td>
+          <td>{s.level}</td>
+          <td>{s.phone}</td>
+          <td>{s.card_uid}</td>
+          <td>{s.created_at?.slice(0,10)}</td>
+          <td>
+            <button className="btn" onClick={()=>setEditStudent(s)}>Edit</button>
+            <button className="btn warn" style={{marginLeft:8}} onClick={()=>handleDeleteStudent(s.id!)}>Delete</button>
+          </td>
+        </tr>)}
+        {students.length===0 && <tr><td colSpan={8} className="notice">No students.</td></tr>}
+      </tbody>
+    </table>
+  </div>
+}
+
+function SettingsView({sendSerialCommand, connected}:{sendSerialCommand:(cmd:string)=>void; connected:boolean}){
   return <div>
     <div style={{fontWeight:700}}>Settings</div>
     <p className="notice">Set env vars in <code>.env</code>:
@@ -499,5 +669,6 @@ function SettingsView(){
       <br/>• <code>VITE_ADMIN_USER</code>, <code>VITE_ADMIN_PASS</code> (optional admin login)
     </p>
     <p className="notice">Works fully with manual input if no hardware is connected. Use <b>Connect Reader</b> for Web Serial.</p>
+    {/* Removed toggle as per request */}
   </div>
 }

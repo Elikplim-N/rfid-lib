@@ -1,6 +1,6 @@
 export type SerialEvent = {event:'card', uid:string} | {event:'item', tag:string} | {event:'hb', ts:string}
 
-export async function requestPort(): Promise<SerialPort | null>{
+export async function requestPort(): Promise<any | null>{
   if(!('serial' in navigator)){
     alert('Web Serial API not supported. Use Chrome/Edge on desktop, or run the Python bridge.')
     return null
@@ -13,11 +13,11 @@ export async function requestPort(): Promise<SerialPort | null>{
   }
 }
 
-export async function readJsonLines(port: SerialPort, onMessage:(obj:any)=>void, onClose?:()=>void){
+export async function readLines(port: any, onMessage:(obj:any)=>void, onClose?:()=>void){
   await port.open({ baudRate: 115200 })
   const textDecoder = new TextDecoderStream()
-  const readable = (port.readable as ReadableStream).pipeThrough(textDecoder)
-  const reader = (readable as ReadableStream<string>).getReader()
+  const readable = port.readable.pipeThrough(textDecoder)
+  const reader = readable.getReader()
   let buffer = ''
   try{
     while(true){
@@ -30,11 +30,10 @@ export async function readJsonLines(port: SerialPort, onMessage:(obj:any)=>void,
         const line = buffer.slice(0, idx).trim()
         buffer = buffer.slice(idx+1)
         if(!line) continue
-        try{
-          onMessage(JSON.parse(line))
-        }catch{
-          // ignore bad json line
-        }
+        if(line.startsWith('CARD_SCANNED:')){
+          const uid = line.replace('CARD_SCANNED:', '').trim()
+          onMessage({event: 'card', uid})
+        } // Add similar for 'ITEM_SCANNED:' if needed
       }
     }
   } finally {
