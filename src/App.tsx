@@ -1,5 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { stats, db, Tx, Student, Loan, addDays, activeLoansForStudent, countActiveLoans } from './lib/db'
+import {
+  stats, db, Tx, Student, Loan, addDays,
+  activeLoansForStudent, countActiveLoans,
+  ensurePersistence, openDB, exportJsonBlob, importFromJson
+} from './lib/db'
 import { requestPort, readLines } from './lib/serial'
 import { upsertTransactions } from './lib/supabase'
 
@@ -47,13 +51,12 @@ export default function App(){
   const [route, setRoute] = useRoute()
   const [log, setLog] = useState<string>('')
   const logBoxRef = useRef<HTMLDivElement>(null)
-  const [connected, setConnected] = useState(false)           // real/serial port
-  const [manualConnected, setManualConnected] = useState(false) // manual admin toggle
+  const [connected, setConnected] = useState(false)
   const [autosync, setAutosync] = useState(true)
   const [port, setPort] = useState<any>(null)
   const [lastScannedUID, setLastScannedUID] = useState<string>('')
 
-  // Borrow/Return inputs
+  // Borrow/Return refs
   const borrowCardRef = useRef<HTMLInputElement>(null)
   const borrowIndexRef = useRef<HTMLInputElement>(null)
   const borrowItemTagRef = useRef<HTMLInputElement>(null)
@@ -73,17 +76,24 @@ export default function App(){
   const [txQuery, setTxQuery] = useState('')
   const [loans, setLoans] = useState<Loan[]>([])
   const [alerts, setAlerts] = useState<Loan[]>([])
+  const [deviceStatus, setDeviceStatus] = useState<any>(null)
 
-  useEffect(()=>{
-    if(!authed) return
-    (async()=>{
+  // === INIT: open DB & request persistence, then hydrate UI ===
+  useEffect(() => {
+    (async () => {
+      await openDB()
+      const granted = await ensurePersistence()
+      if (!granted) {
+        console.info('Persistent storage not granted — data may be evicted under low disk.')
+      }
       setStudents(await db.students.orderBy('created_at').reverse().toArray())
       setTx(await db.transactions.orderBy('occurred_at').reverse().limit(500).toArray())
       refreshAlerts()
     })()
-  }, [authed])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  // Autosync
+  // Autosync to Supabase
   useEffect(()=>{
     if(!authed) return
     if(!autosync) return
@@ -94,20 +104,20 @@ export default function App(){
 
   function append(s:string){
     setLog(l => l + `[${new Date().toLocaleTimeString()}] ${s}\n`)
-    // scroll to bottom
     setTimeout(()=>{
       const el = logBoxRef.current
       if(el) el.scrollTop = el.scrollHeight
     }, 0)
   }
 
-  // Serial → route-aware inputs + last scanned
-  function handleEvent(data:any){
-    const evt = data?.event
-    if(evt === 'card'){
-      const uid = data.uid
+  // ==== Web Serial events ====
+  function onDeviceLine(evt:any){
+    if (evt?.line) append(evt.line) // always keep raw log
+
+    if (evt?.event === 'card') {
+      const uid = evt.uid
       setLastScannedUID(uid)
-      append(`[CARD] Scanned ${uid} (use in any field)`)
+      append(`[CARD] ${uid}`)
       if (route === '#borrow' && borrowCardRef.current) {
         borrowCardRef.current.value = uid
         append(`[CARD→Borrow] ${uid}`)
@@ -116,13 +126,8 @@ export default function App(){
         append(`[CARD→Return] ${uid}`)
         loadLoansForReturn()
       }
-    } else if(evt === 'item'){
-      if (route === '#borrow' && borrowItemTagRef.current) {
-        borrowItemTagRef.current.value = data.tag
-        append(`[ITEM→Borrow] ${data.tag}`)
-      } else {
-        append(`[ITEM] ${data.tag}`)
-      }
+    } else if (evt?.event === 'status') {
+      setDeviceStatus(evt.data)
     }
   }
 
@@ -131,12 +136,13 @@ export default function App(){
     if(!p){ append('Serial not available or cancelled.'); return }
     setPort(p)
     setConnected(true)
-    append('Connected to reader.')
-    readLines(p, handleEvent, ()=>{
+    append('Connected to device.')
+    readLines(p, onDeviceLine, ()=>{
       append('Port closed.')
       setConnected(false)
       setPort(null)
     })
+    await sendSerialCommand('STATUS')
   }
 
   async function sendSerialCommand(cmd: string){
@@ -148,7 +154,7 @@ export default function App(){
       const writer = port.writable.getWriter()
       await writer.write(new TextEncoder().encode(cmd + '\n'))
       writer.releaseLock()
-      append(`Sent command: ${cmd}`)
+      append(`> ${cmd}`)
     }catch(e){
       append(`Write error: ${e}`)
     }
@@ -189,12 +195,8 @@ export default function App(){
     const item_title = borrowItemTitleRef.current!.value.trim() || null
     const days = Math.max(1, parseInt(borrowDaysRef.current!.value || '14', 10))
 
-    if(!item_tag){
-      alert('Enter item tag (or scan item).'); return
-    }
-    if(!card_uid && !index_number){
-      alert('Scan/enter a card UID or provide a student index.'); return
-    }
+    if(!item_tag){ alert('Enter item tag (or scan item).'); return }
+    if(!card_uid && !index_number){ alert('Scan/enter a card UID or provide a student index.'); return }
 
     let stu: Student | undefined
     if(index_number){
@@ -208,6 +210,9 @@ export default function App(){
     if(activeCnt >= 3){ alert(`Loan limit reached. ${stu.full_name} already has ${activeCnt} active loan(s).`); return }
 
     const now = new Date().toISOString()
+    const dueIso = addDays(now, days)
+    const dueDateStr = dueIso.slice(0,10) // YYYY-MM-DD for firmware
+
     const loan: Loan = {
       id: crypto.randomUUID(),
       student_index: stu.index_number,
@@ -215,7 +220,7 @@ export default function App(){
       item_tag,
       item_title,
       borrowed_at: now,
-      due_at: addDays(now, days),
+      due_at: dueIso,
       returned_at: null,
       status: 'ACTIVE',
       device_id: 'web-kiosk',
@@ -236,8 +241,14 @@ export default function App(){
     await db.transactions.add(tx)
     setTx(v => [tx, ...v])
     refresh(); refreshAlerts()
-    append(`[BORROW] ${stu.index_number} -> ${item_tag} (due ${loan.due_at.slice(0,10)})`)
+    append(`[BORROW] ${stu.index_number} -> ${item_tag} (due ${dueDateStr})`)
     borrowItemTagRef.current!.value = ''; borrowItemTitleRef.current!.value = ''
+
+    // Tell device (so it can queue SMS / reminders)
+    if (connected && stu.card_uid) {
+      await sendSerialCommand(`SET STUDENT ${stu.card_uid.toUpperCase()} | ${stu.full_name} | ${stu.phone ?? ''}`)
+      await sendSerialCommand(`BORROW ${stu.card_uid.toUpperCase()} | ${item_tag} | ${dueDateStr} | ${now.slice(0,10)}`)
+    }
   }
 
   // ===== Return flow =====
@@ -269,6 +280,11 @@ export default function App(){
     refresh(); refreshAlerts()
     append(`[RETURN] ${loan.student_index} -> ${loan.item_tag}`)
     await loadLoansForReturn()
+
+    // Tell device (so it can send a "thanks" SMS)
+    if (connected && loan.user_uid) {
+      await sendSerialCommand(`RETURN ${loan.user_uid.toUpperCase()} | ${loan.item_tag}`)
+    }
   }
 
   // ===== Alerts =====
@@ -325,11 +341,10 @@ export default function App(){
         <button className="btn" onClick={()=> setAutosync(a=>!a)}>{autosync ? 'Auto-sync: ON' : 'Auto-sync: OFF'}</button>
         <button className="btn primary" onClick={()=> trySync(false)}>Sync Now</button>
         <button className="btn" onClick={connectSerial} disabled={connected}>{connected ? 'Port: Connected' : 'Connect Reader'}</button>
-        <button className="btn" onClick={()=> setManualConnected(v=>!v)}>{manualConnected ? 'Mark Disconnected' : 'Mark Connected'}</button>
-        <button className="btn" onClick={()=> { localStorage.removeItem('authed'); setAuthed(false) }}>Logout</button>
+        <button className="btn" onClick={()=> { localStorage.removeItem('authed'); location.reload() }}>Logout</button>
       </div>
       <div className="badge">
-        <span>Device: <b>{connected || manualConnected ? 'Connected' : 'Disconnected'}</b></span>
+        <span>Device: <b>{connected ? 'Connected' : 'Disconnected'}</b></span>
         <span>Today: <b>{today}</b></span>
         <span>Total: <b>{total}</b></span>
         <span>Unsynced: <b style={{color: unsynced? ORANGE : 'inherit'}}>{unsynced}</b></span>
@@ -353,7 +368,6 @@ export default function App(){
             refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }}
             onSubmit={submitBorrow}
             lastScannedUID={lastScannedUID}
-            setLastScannedUID={setLastScannedUID}
           />
         ) : route === '#return' ? (
           <ReturnView
@@ -362,7 +376,6 @@ export default function App(){
             loadLoans={loadLoansForReturn}
             onReturn={markReturned}
             lastScannedUID={lastScannedUID}
-            setLastScannedUID={setLastScannedUID}
           />
         ) : route === '#students' ? (
           <StudentsView list={filtStudents} stQuery={stQuery} setStQuery={setStQuery} />
@@ -375,14 +388,24 @@ export default function App(){
             refresh={refresh}
             append={append}
             lastScannedUID={lastScannedUID}
-            setLastScannedUID={setLastScannedUID}
             manageAddCardRef={manageAddCardRef}
             manageEditCardRef={manageEditCardRef}
           />
         ) : route === '#settings' ? (
-          <SettingsView sendSerialCommand={sendSerialCommand} connected={connected} />
+          <SettingsView
+            sendSerialCommand={sendSerialCommand}
+            connected={connected}
+            deviceStatus={deviceStatus}
+          />
         ) : (
-          <DashboardView log={log} alerts={alerts} onRefreshAlerts={refreshAlerts} logBoxRef={logBoxRef} sendSerialCommand={sendSerialCommand} connected={connected} />
+          <DashboardView
+            log={log}
+            alerts={alerts}
+            onRefreshAlerts={refreshAlerts}
+            logBoxRef={logBoxRef}
+            sendSerialCommand={sendSerialCommand}
+            connected={connected}
+          />
         )}
       </div>
     </div>
@@ -391,24 +414,23 @@ export default function App(){
 
 // ---------- Views ----------
 
-function DashboardView({log, alerts, onRefreshAlerts, logBoxRef, sendSerialCommand, connected}:{log:string; alerts:Loan[]; onRefreshAlerts:()=>void; logBoxRef:React.RefObject<HTMLDivElement>; sendSerialCommand:(cmd:string)=>void; connected:boolean}){
+function DashboardView({
+  log, alerts, onRefreshAlerts, logBoxRef, sendSerialCommand, connected
+}:{ log:string; alerts:Loan[]; onRefreshAlerts:()=>void; logBoxRef:React.RefObject<HTMLDivElement>; sendSerialCommand:(cmd:string)=>void; connected:boolean }){
   const [s, setS] = useState({total:0,today:0,unsynced:0,borrowed:0,returned:0})
   useEffect(()=>{ stats().then(setS) }, [log])
   useEffect(()=>{ onRefreshAlerts() }, [log])
 
   async function sendReminder(loan: Loan){
     const student = await db.students.where('index_number').equals(loan.student_index || '').first()
-    if(!student){
-      alert('Student not found.')
-      return
+    if(!student){ alert('Student not found.'); return }
+    if(!student.phone){ alert('No phone number for this student.'); return }
+    if (connected && student.card_uid) {
+      await sendSerialCommand(`SET STUDENT ${student.card_uid.toUpperCase()} | ${student.full_name} | ${student.phone}`)
+      await sendSerialCommand(`REMIND ONE ${student.card_uid.toUpperCase()} | ${loan.item_tag}`)
+    } else {
+      alert('Connect device to use SMS reminders.')
     }
-    if(!student.phone){
-      alert('No phone number for this student.')
-      return
-    }
-    const overdue = new Date(loan.due_at) < new Date()
-    const message = `Library Reminder: Your item "${loan.item_title ?? loan.item_tag}" is ${overdue ? 'overdue' : 'due soon'} (due: ${loan.due_at.slice(0,10)}). Please return it promptly.`
-    sendSerialCommand(`SEND_SMS|${student.phone}|${message}`)
   }
 
   return <>
@@ -457,15 +479,9 @@ function DashboardView({log, alerts, onRefreshAlerts, logBoxRef, sendSerialComma
 }
 
 function BorrowView({
-  refs,
-  onSubmit,
-  lastScannedUID,
-  setLastScannedUID
-}: {
-  refs: any
-  onSubmit: () => Promise<void>
-  lastScannedUID: string
-  setLastScannedUID: React.Dispatch<React.SetStateAction<string>>
+  refs, onSubmit, lastScannedUID
+}:{
+  refs: any; onSubmit: () => Promise<void>; lastScannedUID: string
 }){
   return <div style={{maxWidth:860}}>
     <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Borrow</div>
@@ -495,19 +511,10 @@ function BorrowView({
 }
 
 function ReturnView({
-  refs,
-  loans,
-  loadLoans,
-  onReturn,
-  lastScannedUID,
-  setLastScannedUID
-}: {
-  refs: any
-  loans: Loan[]
-  loadLoans: () => Promise<void>
-  onReturn: (l: Loan) => Promise<void>
+  refs, loans, loadLoans, onReturn, lastScannedUID
+}:{
+  refs: any; loans: Loan[]; loadLoans: () => Promise<void>; onReturn: (l: Loan) => Promise<void>;
   lastScannedUID: string
-  setLastScannedUID: React.Dispatch<React.SetStateAction<string>>
 }){
   return <div style={{maxWidth:960}}>
     <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Return</div>
@@ -594,21 +601,14 @@ function TransactionsView({list, txQuery, setTxQuery}:{list:Tx[]; txQuery:string
 }
 
 function ManageStudentsView({
-  students,
-  setStudents,
-  refresh,
-  append,
-  lastScannedUID,
-  setLastScannedUID,
-  manageAddCardRef,
-  manageEditCardRef
+  students, setStudents, refresh, append,
+  lastScannedUID, manageAddCardRef, manageEditCardRef
 }: {
   students: Student[]
   setStudents: React.Dispatch<React.SetStateAction<Student[]>>
   refresh: () => Promise<void>
   append: (s: string) => void
   lastScannedUID: string
-  setLastScannedUID: React.Dispatch<React.SetStateAction<string>>
   manageAddCardRef: React.RefObject<HTMLInputElement>
   manageEditCardRef: React.RefObject<HTMLInputElement>
 }){
@@ -721,13 +721,85 @@ function ManageStudentsView({
   </div>
 }
 
-function SettingsView({sendSerialCommand, connected}:{sendSerialCommand:(cmd:string)=>void; connected:boolean}){
+function SettingsView({
+  sendSerialCommand, connected, deviceStatus
+}:{ sendSerialCommand:(cmd:string)=>void; connected:boolean; deviceStatus:any }){
+
+  const [exporting, setExporting] = useState(false)
+  const [importing, setImporting] = useState(false)
+
+  async function doExport(){
+    try{
+      setExporting(true)
+      const blob = await exportJsonBlob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `library-web-backup-${new Date().toISOString().slice(0,10)}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  async function doImport(e: React.ChangeEvent<HTMLInputElement>){
+    const file = e.target.files?.[0]
+    if(!file) return
+    if(!confirm('Importing will merge/overwrite local data. Continue?')) return
+    try{
+      setImporting(true)
+      await importFromJson(file)
+      alert('Import complete. Reloading to reflect changes.')
+      location.reload()
+    } catch (err:any) {
+      alert('Import failed: ' + String(err?.message || err))
+    } finally {
+      setImporting(false)
+      e.currentTarget.value = ''
+    }
+  }
+
   return <div>
-    <div style={{fontWeight:700}}>Settings</div>
+    <div style={{fontWeight:700, marginBottom:8}}>Device Controls</div>
+    <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+      <button className="btn" onClick={()=>sendSerialCommand('SCAN')} disabled={!connected}>SCAN</button>
+      <button className="btn" onClick={()=>sendSerialCommand('SMS ON')} disabled={!connected}>SMS ON</button>
+      <button className="btn" onClick={()=>sendSerialCommand('SMS OFF')} disabled={!connected}>SMS OFF</button>
+      <button className="btn" onClick={()=>sendSerialCommand('AUTO ON 180')} disabled={!connected}>AUTO ON (180m)</button>
+      <button className="btn" onClick={()=>sendSerialCommand('AUTO OFF')} disabled={!connected}>AUTO OFF</button>
+      <button className="btn" onClick={()=>sendSerialCommand('STATUS')} disabled={!connected}>STATUS</button>
+      <button className="btn primary" onClick={()=>sendSerialCommand('REMIND ALL')} disabled={!connected}>REMIND ALL</button>
+    </div>
+    <div style={{marginTop:10}} className="notice">
+      {connected
+        ? deviceStatus
+          ? <>SMS: <b>{deviceStatus.sms}</b> • Students: <b>{deviceStatus.students}</b> • Active: <b>{deviceStatus.activeBorrows}</b> • Queue: <b>{deviceStatus.queuePending}</b> • Auto: <b>{deviceStatus.auto}</b> ({deviceStatus.intervalMin}m)</>
+          : 'Connected. Click STATUS to refresh.'
+        : 'Connect your device to enable controls.'}
+    </div>
+
+    <hr className="sep"/>
+
+    <div style={{fontWeight:700, marginBottom:8}}>Local Database (IndexedDB)</div>
+    <p className="notice">
+      Data is stored locally in your browser (IndexedDB). We request <b>Persistent Storage</b> so it isn’t auto-cleared.
+      Use backup/restore if you need to move machines or snapshot data.
+    </p>
+    <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+      <button className="btn" onClick={doExport} disabled={exporting}>{exporting ? 'Exporting…' : 'Export Backup (.json)'}</button>
+      <label className="btn" style={{display:'inline-flex', alignItems:'center', gap:8, cursor:'pointer'}}>
+        {importing ? 'Importing…' : 'Import Backup (.json)'}
+        <input type="file" accept="application/json" onChange={doImport} hidden />
+      </label>
+    </div>
+
+    <hr className="sep"/>
+
+    <div style={{fontWeight:700, marginBottom:8}}>Configuration</div>
     <p className="notice">Set env vars in <code>.env</code>:
       <br/>• <code>VITE_SUPABASE_URL</code>, <code>VITE_SUPABASE_ANON_KEY</code> (optional for cloud sync)
       <br/>• <code>VITE_ADMIN_USER</code>, <code>VITE_ADMIN_PASS</code> (optional admin login)
     </p>
-    <p className="notice">Works fully with manual input if no hardware is connected. Use <b>Connect Reader</b> for Web Serial.</p>
   </div>
 }
