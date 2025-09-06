@@ -1,5 +1,4 @@
 import Dexie, { Table } from 'dexie'
-// @ts-expect-error types are optional; tiny helper for backup/restore
 import { exportDB, importInto } from 'dexie-export-import'
 
 export interface Tx {
@@ -44,16 +43,15 @@ class DB extends Dexie {
   loans!: Table<Loan, string>
 
   constructor() {
-    // ⚠️ keep DB name stable to preserve data across refreshes
     super('library_web')
 
-    // v1 (initial)
+    // v1
     this.version(1).stores({
       transactions: 'id, synced, occurred_at',
       students: '++id, index_number, card_uid, created_at'
     })
 
-    // v2 (adds loans + index on action)
+    // v2
     this.version(2).stores({
       transactions: 'id, synced, occurred_at, action',
       students: '++id, index_number, card_uid, created_at',
@@ -65,12 +63,9 @@ class DB extends Dexie {
 export const db = new DB()
 
 // ---- Persistence helpers ----
-
-// Call once at startup. Requests “persistent storage” so the browser won’t evict IndexedDB.
 export async function ensurePersistence(): Promise<boolean> {
   if ('storage' in navigator && 'persist' in navigator.storage) {
     try {
-      // If already persisted, this returns true; otherwise request it.
       const persisted = await navigator.storage.persisted?.()
       if (persisted) return true
       return await navigator.storage.persist()
@@ -81,13 +76,11 @@ export async function ensurePersistence(): Promise<boolean> {
   return false
 }
 
-// Optional: explicit open (helps in Safari/Edge quirks on first load)
 export async function openDB() {
-  if (db.isOpen()) return
-  await db.open()
+  if (!db.isOpen()) await db.open()
 }
 
-// ---- Quick stats (unchanged) ----
+// ---- Stats ----
 export async function stats() {
   const total = await db.transactions.count()
   const todayStr = new Date().toISOString().slice(0, 10)
@@ -98,7 +91,7 @@ export async function stats() {
   return { total, today, unsynced, borrowed, returned }
 }
 
-// ---- Queries (unchanged) ----
+// ---- Queries ----
 export async function activeLoansForStudent(indexOrUid: { index_number?: string; card_uid?: string }) {
   let idx: string | null = null
   if (indexOrUid.index_number) {
@@ -121,13 +114,11 @@ export function addDays(dateIso: string, days: number) {
   return d.toISOString()
 }
 
-// ---- Backup / Restore ----
+// ---- Backup / Restore (via dexie-export-import) ----
 export async function exportJsonBlob(): Promise<Blob> {
-  // includes all tables + schema
   return exportDB(db)
 }
 
 export async function importFromJson(file: File): Promise<void> {
-  // merge into current DB (without dropping)
   await importInto(db, file, { overwriteValues: true })
 }

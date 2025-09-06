@@ -5,7 +5,7 @@ import {
   ensurePersistence, openDB, exportJsonBlob, importFromJson
 } from './lib/db'
 import { requestPort, readLines } from './lib/serial'
-import { upsertTransactions } from './lib/supabase'
+import { upsertTransactions, isSupabaseConfigured } from './lib/supabase'
 
 const BLUE = '#166FE5'
 const ORANGE = '#FF7A00'
@@ -47,13 +47,18 @@ export default function App(){
   const [authed, setAuthed] = useState<boolean>(() => localStorage.getItem('authed') === '1')
   const [u, setU] = useState(''); const [p, setP] = useState('')
 
-  // App state
+  // Route & UI state
   const [route, setRoute] = useRoute()
   const [log, setLog] = useState<string>('')
   const logBoxRef = useRef<HTMLDivElement>(null)
+
+  // Device & sync
   const [connected, setConnected] = useState(false)
   const [autosync, setAutosync] = useState(true)
   const [port, setPort] = useState<any>(null)
+  const [deviceStatus, setDeviceStatus] = useState<any>(null)
+
+  // Scans
   const [lastScannedUID, setLastScannedUID] = useState<string>('')
 
   // Borrow/Return refs
@@ -69,6 +74,7 @@ export default function App(){
   const manageAddCardRef = useRef<HTMLInputElement>(null)
   const manageEditCardRef = useRef<HTMLInputElement>(null)
 
+  // Data
   const { total, today, unsynced, refresh } = useBadges()
   const [students, setStudents] = useState<Student[]>([])
   const [stQuery, setStQuery] = useState('')
@@ -76,16 +82,13 @@ export default function App(){
   const [txQuery, setTxQuery] = useState('')
   const [loans, setLoans] = useState<Loan[]>([])
   const [alerts, setAlerts] = useState<Loan[]>([])
-  const [deviceStatus, setDeviceStatus] = useState<any>(null)
 
-  // === INIT: open DB & request persistence, then hydrate UI ===
+  // === INIT: open DB & request persistence, hydrate lists ===
   useEffect(() => {
     (async () => {
       await openDB()
       const granted = await ensurePersistence()
-      if (!granted) {
-        console.info('Persistent storage not granted — data may be evicted under low disk.')
-      }
+      if (!granted) console.info('Persistent storage not granted — data may be evicted under low disk.')
       setStudents(await db.students.orderBy('created_at').reverse().toArray())
       setTx(await db.transactions.orderBy('occurred_at').reverse().limit(500).toArray())
       refreshAlerts()
@@ -97,6 +100,7 @@ export default function App(){
   useEffect(()=>{
     if(!authed) return
     if(!autosync) return
+    if(!isSupabaseConfigured()) return // <-- skip if not configured
     const iv = setInterval(()=> trySync(true), 10000)
     return ()=> clearInterval(iv)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -112,7 +116,7 @@ export default function App(){
 
   // ==== Web Serial events ====
   function onDeviceLine(evt:any){
-    if (evt?.line) append(evt.line) // always keep raw log
+    if (evt?.line) append(evt.line) // raw device log
 
     if (evt?.event === 'card') {
       const uid = evt.uid
@@ -161,29 +165,33 @@ export default function App(){
   }
 
   async function trySync(background: boolean) {
+    if (!isSupabaseConfigured()) {
+      if (!background) append('Cloud sync disabled (Supabase not configured).')
+      return
+    }
     const uns = await db.transactions.where('synced').notEqual(1).toArray();
     if (uns.length === 0) {
-      if (!background) append('No unsynced transactions.');
-      return;
+      if (!background) append('No unsynced transactions.')
+      return
     }
     const ok = await fetch((import.meta.env.VITE_SUPABASE_URL || '') + '/status')
       .then(r => r.ok)
       .catch(() => false);
     if (!ok) {
-      if (!background) append('Offline.');
-      return;
+      if (!background) append('Offline.')
+      return
     }
     try {
       const { ok: syncOk, error } = await upsertTransactions(uns);
       if (syncOk) {
         await db.transactions.bulkPut(uns.map(r => ({ ...r, synced: 1 })));
-        append(`Synced ${uns.length} transactions.`);
-        refresh();
+        append(`Synced ${uns.length} transactions.`)
+        refresh()
       } else {
-        append(`Sync failed: ${error || 'Unknown error'}`);
+        append(`Sync failed: ${error || 'Unknown error'}`)
       }
     } catch (e) {
-      append(`Sync failed: ${String(e)}`);
+      append(`Sync failed: ${String(e)}`)
     }
   }
 
@@ -211,7 +219,7 @@ export default function App(){
 
     const now = new Date().toISOString()
     const dueIso = addDays(now, days)
-    const dueDateStr = dueIso.slice(0,10) // YYYY-MM-DD for firmware
+    const dueDateStr = dueIso.slice(0,10)
 
     const loan: Loan = {
       id: crypto.randomUUID(),
@@ -244,7 +252,6 @@ export default function App(){
     append(`[BORROW] ${stu.index_number} -> ${item_tag} (due ${dueDateStr})`)
     borrowItemTagRef.current!.value = ''; borrowItemTitleRef.current!.value = ''
 
-    // Tell device (so it can queue SMS / reminders)
     if (connected && stu.card_uid) {
       await sendSerialCommand(`SET STUDENT ${stu.card_uid.toUpperCase()} | ${stu.full_name} | ${stu.phone ?? ''}`)
       await sendSerialCommand(`BORROW ${stu.card_uid.toUpperCase()} | ${item_tag} | ${dueDateStr} | ${now.slice(0,10)}`)
@@ -281,7 +288,6 @@ export default function App(){
     append(`[RETURN] ${loan.student_index} -> ${loan.item_tag}`)
     await loadLoansForReturn()
 
-    // Tell device (so it can send a "thanks" SMS)
     if (connected && loan.user_uid) {
       await sendSerialCommand(`RETURN ${loan.user_uid.toUpperCase()} | ${loan.item_tag}`)
     }
@@ -363,54 +369,66 @@ export default function App(){
       </div>
 
       <div className="content">
-        {route === '#borrow' ? (
-          <BorrowView
-            refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }}
-            onSubmit={submitBorrow}
-            lastScannedUID={lastScannedUID}
-          />
-        ) : route === '#return' ? (
-          <ReturnView
-            refs={{ returnCardRef, returnIndexRef }}
-            loans={loans}
-            loadLoans={loadLoansForReturn}
-            onReturn={markReturned}
-            lastScannedUID={lastScannedUID}
-          />
-        ) : route === '#students' ? (
-          <StudentsView list={filtStudents} stQuery={stQuery} setStQuery={setStQuery} />
-        ) : route === '#transactions' ? (
-          <TransactionsView list={filtTx} txQuery={txQuery} setTxQuery={setTxQuery} />
-        ) : route === '#manage-students' ? (
-          <ManageStudentsView
-            students={students}
-            setStudents={setStudents}
-            refresh={refresh}
-            append={append}
-            lastScannedUID={lastScannedUID}
-            manageAddCardRef={manageAddCardRef}
-            manageEditCardRef={manageEditCardRef}
-          />
-        ) : route === '#settings' ? (
-          <SettingsView
-            sendSerialCommand={sendSerialCommand}
-            connected={connected}
-            deviceStatus={deviceStatus}
-          />
-        ) : (
-          <DashboardView
-            log={log}
-            alerts={alerts}
-            onRefreshAlerts={refreshAlerts}
-            logBoxRef={logBoxRef}
-            sendSerialCommand={sendSerialCommand}
-            connected={connected}
-          />
-        )}
+        <div className="content-inner">
+          {route === '#borrow' ? (
+            <BorrowView
+              refs={{ borrowCardRef, borrowIndexRef, borrowItemTagRef, borrowItemTitleRef, borrowDaysRef }}
+              onSubmit={submitBorrow}
+              lastScannedUID={lastScannedUID}
+              connected={connected}
+              sendSerialCommand={sendSerialCommand}
+            />
+          ) : route === '#return' ? (
+            <ReturnView
+              refs={{ returnCardRef, returnIndexRef }}
+              loans={loans}
+              loadLoans={loadLoansForReturn}
+              onReturn={markReturned}
+              lastScannedUID={lastScannedUID}
+              connected={connected}
+              sendSerialCommand={sendSerialCommand}
+            />
+          ) : route === '#students' ? (
+            <StudentsView list={filtStudents} stQuery={stQuery} setStQuery={setStQuery} />
+          ) : route === '#transactions' ? (
+            <TransactionsView list={filtTx} txQuery={txQuery} setTxQuery={setTxQuery} />
+          ) : route === '#manage-students' ? (
+            <ManageStudentsView
+              students={students}
+              setStudents={setStudents}
+              refresh={refresh}
+              append={append}
+              lastScannedUID={lastScannedUID}
+              manageAddCardRef={manageAddCardRef}
+              manageEditCardRef={manageEditCardRef}
+              connected={connected}
+              sendSerialCommand={sendSerialCommand}
+            />
+          ) : route === '#settings' ? (
+            <SettingsView
+              sendSerialCommand={sendSerialCommand}
+              connected={connected}
+              deviceStatus={deviceStatus}
+            />
+          ) : (
+            <DashboardView
+              log={log}
+              alerts={alerts}
+              onRefreshAlerts={refreshAlerts}
+              logBoxRef={logBoxRef}
+              sendSerialCommand={sendSerialCommand}
+              connected={connected}
+            />
+          )}
+        </div>
       </div>
     </div>
   </>
 }
+
+// ---------- Views (unchanged from my previous message, already responsive) ----------
+/* ... keep the same BorrowView, ReturnView, StudentsView, TransactionsView,
+   ManageStudentsView, SettingsView, DashboardView from my previous reply ... */
 
 // ---------- Views ----------
 
@@ -445,7 +463,12 @@ function DashboardView({
 
     <div style={{display:'grid', gridTemplateColumns:'1fr', gap:12}}>
       <div>
-        <div style={{fontWeight:600, marginBottom:6}}>Live Log</div>
+        <div style={{fontWeight:600, marginBottom:6, display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+          <span>Live Log</span>
+          <div style={{display:'flex', gap:8}}>
+            <button className="btn" onClick={()=>sendSerialCommand('STATUS')} disabled={!connected}>STATUS</button>
+          </div>
+        </div>
         <div className="logbox" ref={logBoxRef}>
           <pre className="log">{log || '[info] ready'}</pre>
         </div>
@@ -453,38 +476,47 @@ function DashboardView({
 
       <div>
         <div style={{fontWeight:600, marginBottom:6}}>Due Soon / Overdue</div>
-        <table className="table">
-          <thead><tr>
-            <th>Student</th><th>Book</th><th>Due</th><th>Status</th><th>Action</th>
-          </tr></thead>
-          <tbody>
-            {alerts.map(l=>{
-              const overdue = new Date(l.due_at) < new Date()
-              return (
-                <tr key={l.id}>
-                  <td>{l.student_index}</td>
-                  <td>{l.item_title ?? l.item_tag}</td>
-                  <td>{l.due_at.slice(0,19).replace('T',' ')}</td>
-                  <td style={{color: overdue ? '#DC2626' : '#B45309'}}>{overdue ? 'Overdue' : 'Due soon'}</td>
-                  <td><button className="btn primary" disabled={!connected} onClick={()=>sendReminder(l)}>Send Reminder SMS</button></td>
-                </tr>
-              )
-            })}
-            {alerts.length===0 && <tr><td colSpan={5} className="notice">No upcoming or overdue items.</td></tr>}
-          </tbody>
-        </table>
+        <div className="table-wrap">
+          <table className="table">
+            <thead><tr>
+              <th>Student</th><th>Book</th><th>Due</th><th>Status</th><th>Action</th>
+            </tr></thead>
+            <tbody>
+              {alerts.map(l=>{
+                const overdue = new Date(l.due_at) < new Date()
+                return (
+                  <tr key={l.id}>
+                    <td>{l.student_index}</td>
+                    <td>{l.item_title ?? l.item_tag}</td>
+                    <td>{l.due_at.slice(0,19).replace('T',' ')}</td>
+                    <td style={{color: overdue ? '#DC2626' : '#B45309'}}>{overdue ? 'Overdue' : 'Due soon'}</td>
+                    <td><button className="btn primary" disabled={!connected} onClick={()=>sendReminder(l)}>Send Reminder SMS</button></td>
+                  </tr>
+                )
+              })}
+              {alerts.length===0 && <tr><td colSpan={5} className="notice">No upcoming or overdue items.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   </>
 }
 
 function BorrowView({
-  refs, onSubmit, lastScannedUID
+  refs, onSubmit, lastScannedUID, connected, sendSerialCommand
 }:{
-  refs: any; onSubmit: () => Promise<void>; lastScannedUID: string
+  refs:any; onSubmit:()=>Promise<void>; lastScannedUID:string;
+  connected:boolean; sendSerialCommand:(cmd:string)=>void
 }){
   return <div style={{maxWidth:860}}>
-    <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Borrow</div>
+    <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', gap:12}}>
+      <div style={{fontWeight:700, fontSize:18}}>Borrow</div>
+      <div style={{display:'flex', gap:8}}>
+        <button className="btn" onClick={()=>sendSerialCommand('SCAN')} disabled={!connected}>SCAN</button>
+        <button className="btn" onClick={()=>sendSerialCommand('STATUS')} disabled={!connected}>STATUS</button>
+      </div>
+    </div>
     <p className="notice">Scan card (or enter manually), then enter book details and duration. Students may hold up to <b>3</b> active loans.</p>
     <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
       <div>
@@ -502,22 +534,29 @@ function BorrowView({
         <input ref={refs.borrowItemTitleRef} placeholder="Title (optional but nice)" className="search" style={{marginTop:8}} />
       </div>
     </div>
-    <div style={{display:'flex', gap:12, marginTop:12, alignItems:'center'}}>
+    <div style={{display:'flex', gap:12, marginTop:12, alignItems:'center', flexWrap:'wrap'}}>
       <input ref={refs.borrowDaysRef} defaultValue="14" type="number" min={1} className="search" style={{width:120}} />
       <span className="notice">days</span>
       <button className="btn primary" onClick={onSubmit}>Confirm Borrow</button>
+      {!connected && <span className="notice">Device not connected — borrowing still saves locally.</span>}
     </div>
   </div>
 }
 
 function ReturnView({
-  refs, loans, loadLoans, onReturn, lastScannedUID
+  refs, loans, loadLoans, onReturn, lastScannedUID, connected, sendSerialCommand
 }:{
-  refs: any; loans: Loan[]; loadLoans: () => Promise<void>; onReturn: (l: Loan) => Promise<void>;
-  lastScannedUID: string
+  refs:any; loans: Loan[]; loadLoans: () => Promise<void>; onReturn: (l: Loan) => Promise<void>;
+  lastScannedUID: string; connected:boolean; sendSerialCommand:(cmd:string)=>void
 }){
   return <div style={{maxWidth:960}}>
-    <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Return</div>
+    <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', gap:12}}>
+      <div style={{fontWeight:700, fontSize:18}}>Return</div>
+      <div style={{display:'flex', gap:8}}>
+        <button className="btn" onClick={()=>sendSerialCommand('SCAN')} disabled={!connected}>SCAN</button>
+        <button className="btn" onClick={()=>sendSerialCommand('STATUS')} disabled={!connected}>STATUS</button>
+      </div>
+    </div>
     <p className="notice">Scan card (or enter index) to list active loans for that student, then mark the returned item.</p>
     <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
       <div style={{display:'flex', gap:8}}>
@@ -526,31 +565,34 @@ function ReturnView({
       </div>
       <input ref={refs.returnIndexRef} placeholder="Student Index (optional)" className="search" />
     </div>
-    <div style={{marginTop:10}}>
+    <div style={{marginTop:10, display:'flex', gap:8, flexWrap:'wrap'}}>
       <button className="btn" onClick={loadLoans}>Load Loans</button>
+      {!connected && <span className="notice">Device not connected — marking returns still saves locally.</span>}
     </div>
 
-    <table className="table" style={{marginTop:12}}>
-      <thead><tr>
-        <th>Book</th><th>Item Tag</th><th>Borrowed</th><th>Due</th><th>Status</th><th>Action</th>
-      </tr></thead>
-      <tbody>
-        {loans.map(l=>{
-          const overdue = new Date(l.due_at) < new Date()
-          return (
-            <tr key={l.id}>
-              <td>{l.item_title ?? '-'}</td>
-              <td>{l.item_tag}</td>
-              <td>{l.borrowed_at.slice(0,19).replace('T',' ')}</td>
-              <td>{l.due_at.slice(0,19).replace('T',' ')}</td>
-              <td style={{color: overdue ? '#DC2626' : '#16A34A'}}>{overdue ? 'Overdue' : 'Active'}</td>
-              <td><button className="btn primary" onClick={()=> onReturn(l)}>Mark Returned</button></td>
-            </tr>
-          )
-        })}
-        {loans.length===0 && <tr><td colSpan={6} className="notice">No active loans for that student.</td></tr>}
-      </tbody>
-    </table>
+    <div className="table-wrap" style={{marginTop:12}}>
+      <table className="table">
+        <thead><tr>
+          <th>Book</th><th>Item Tag</th><th>Borrowed</th><th>Due</th><th>Status</th><th>Action</th>
+        </tr></thead>
+        <tbody>
+          {loans.map(l=>{
+            const overdue = new Date(l.due_at) < new Date()
+            return (
+              <tr key={l.id}>
+                <td>{l.item_title ?? '-'}</td>
+                <td>{l.item_tag}</td>
+                <td>{l.borrowed_at.slice(0,19).replace('T',' ')}</td>
+                <td>{l.due_at.slice(0,19).replace('T',' ')}</td>
+                <td style={{color: overdue ? '#DC2626' : '#16A34A'}}>{overdue ? 'Overdue' : 'Active'}</td>
+                <td><button className="btn primary" onClick={()=> onReturn(l)}>Mark Returned</button></td>
+              </tr>
+            )
+          })}
+          {loans.length===0 && <tr><td colSpan={6} className="notice">No active loans for that student.</td></tr>}
+        </tbody>
+      </table>
+    </div>
   </div>
 }
 
@@ -560,17 +602,19 @@ function StudentsView({list, stQuery, setStQuery}:{list:Student[]; stQuery:strin
       <div style={{fontWeight:700}}>Students</div>
       <input className="search" placeholder="Search" value={stQuery} onChange={e=> setStQuery(e.target.value)} />
     </div>
-    <table className="table" style={{marginTop:8}}>
-      <thead><tr>
-        <th>Index</th><th>Name</th><th>Program</th><th>Level</th><th>Phone</th><th>Card UID</th><th>Created</th>
-      </tr></thead>
-      <tbody>
-        {list.map(s=> <tr key={s.id}>
-          <td>{s.index_number}</td><td>{s.full_name}</td><td>{s.program}</td><td>{s.level}</td><td>{s.phone}</td><td>{s.card_uid}</td><td>{s.created_at?.slice(0,19).replace('T',' ')}</td>
-        </tr>)}
-        {list.length===0 && <tr><td colSpan={7} className="notice">No students yet.</td></tr>}
-      </tbody>
-    </table>
+    <div className="table-wrap" style={{marginTop:8}}>
+      <table className="table">
+        <thead><tr>
+          <th>Index</th><th>Name</th><th>Program</th><th>Level</th><th>Phone</th><th>Card UID</th><th>Created</th>
+        </tr></thead>
+        <tbody>
+          {list.map(s=> <tr key={s.id}>
+            <td>{s.index_number}</td><td>{s.full_name}</td><td>{s.program}</td><td>{s.level}</td><td>{s.phone}</td><td>{s.card_uid}</td><td>{s.created_at?.slice(0,19).replace('T',' ')}</td>
+          </tr>)}
+          {list.length===0 && <tr><td colSpan={7} className="notice">No students yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
   </div>
 }
 
@@ -580,29 +624,32 @@ function TransactionsView({list, txQuery, setTxQuery}:{list:Tx[]; txQuery:string
       <div style={{fontWeight:700}}>Transactions</div>
       <input className="search" placeholder="Search" value={txQuery} onChange={e=> setTxQuery(e.target.value)} />
     </div>
-    <table className="table" style={{marginTop:8}}>
-      <thead><tr>
-        <th>Time</th><th>Action</th><th>Student</th><th>User UID</th><th>Item Tag</th><th>ID</th><th>Synced</th>
-      </tr></thead>
-      <tbody>
-        {list.map(t=> <tr key={t.id}>
-          <td>{t.occurred_at.slice(0,19).replace('T',' ')}</td>
-          <td>{t.action}</td>
-          <td>{t.student_index}</td>
-          <td>{t.user_uid}</td>
-          <td>{t.item_tag}</td>
-          <td style={{maxWidth:240, overflow:'hidden', textOverflow:'ellipsis'}}>{t.id}</td>
-          <td>{t.synced ? '1' : '0'}</td>
-        </tr>)}
-        {list.length===0 && <tr><td colSpan={7} className="notice">No transactions yet.</td></tr>}
-      </tbody>
-    </table>
+    <div className="table-wrap" style={{marginTop:8}}>
+      <table className="table">
+        <thead><tr>
+          <th>Time</th><th>Action</th><th>Student</th><th>User UID</th><th>Item Tag</th><th>ID</th><th>Synced</th>
+        </tr></thead>
+        <tbody>
+          {list.map(t=> <tr key={t.id}>
+            <td>{t.occurred_at.slice(0,19).replace('T',' ')}</td>
+            <td>{t.action}</td>
+            <td>{t.student_index}</td>
+            <td>{t.user_uid}</td>
+            <td>{t.item_tag}</td>
+            <td style={{maxWidth:240, overflow:'hidden', textOverflow:'ellipsis'}}>{t.id}</td>
+            <td>{t.synced ? '1' : '0'}</td>
+          </tr>)}
+          {list.length===0 && <tr><td colSpan={7} className="notice">No transactions yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
   </div>
 }
 
 function ManageStudentsView({
   students, setStudents, refresh, append,
-  lastScannedUID, manageAddCardRef, manageEditCardRef
+  lastScannedUID, manageAddCardRef, manageEditCardRef,
+  connected, sendSerialCommand
 }: {
   students: Student[]
   setStudents: React.Dispatch<React.SetStateAction<Student[]>>
@@ -611,6 +658,8 @@ function ManageStudentsView({
   lastScannedUID: string
   manageAddCardRef: React.RefObject<HTMLInputElement>
   manageEditCardRef: React.RefObject<HTMLInputElement>
+  connected: boolean
+  sendSerialCommand: (cmd:string)=>void
 }){
   const [newStudent, setNewStudent] = useState<Partial<Student>>({})
   const [editStudent, setEditStudent] = useState<Student | null>(null)
@@ -657,7 +706,12 @@ function ManageStudentsView({
   }
 
   return <div>
-    <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Manage Students</div>
+    <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+      <div style={{fontWeight:700, fontSize:18, marginBottom:8}}>Manage Students</div>
+      <div style={{display:'flex', gap:8}}>
+        <button className="btn" onClick={()=>sendSerialCommand('SCAN')} disabled={!connected}>SCAN</button>
+      </div>
+    </div>
     <p className="notice">Create, edit, or delete student records. Scan card and use "Use Last Scan" to fill UID without typing.</p>
     <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(300px,1fr))', gap:16}}>
       <div>
@@ -697,27 +751,29 @@ function ManageStudentsView({
     </div>
     <hr className="sep"/>
     <div style={{fontWeight:600, marginBottom:6}}>All Students</div>
-    <table className="table">
-      <thead><tr>
-        <th>Index</th><th>Name</th><th>Program</th><th>Level</th><th>Phone</th><th>Card UID</th><th>Created</th><th>Actions</th>
-      </tr></thead>
-      <tbody>
-        {students.map(s=> <tr key={s.id}>
-          <td>{s.index_number}</td>
-          <td>{s.full_name}</td>
-          <td>{s.program}</td>
-          <td>{s.level}</td>
-          <td>{s.phone}</td>
-          <td>{s.card_uid}</td>
-          <td>{s.created_at?.slice(0,10)}</td>
-          <td>
-            <button className="btn" onClick={()=>setEditStudent(s)}>Edit</button>
-            <button className="btn warn" style={{marginLeft:8}} onClick={()=>handleDeleteStudent(s.id!)}>Delete</button>
-          </td>
-        </tr>)}
-        {students.length===0 && <tr><td colSpan={8} className="notice">No students.</td></tr>}
-      </tbody>
-    </table>
+    <div className="table-wrap">
+      <table className="table">
+        <thead><tr>
+          <th>Index</th><th>Name</th><th>Program</th><th>Level</th><th>Phone</th><th>Card UID</th><th>Created</th><th>Actions</th>
+        </tr></thead>
+        <tbody>
+          {students.map(s=> <tr key={s.id}>
+            <td>{s.index_number}</td>
+            <td>{s.full_name}</td>
+            <td>{s.program}</td>
+            <td>{s.level}</td>
+            <td>{s.phone}</td>
+            <td>{s.card_uid}</td>
+            <td>{s.created_at?.slice(0,10)}</td>
+            <td>
+              <button className="btn" onClick={()=>setEditStudent(s)}>Edit</button>
+              <button className="btn warn" style={{marginLeft:8}} onClick={()=>handleDeleteStudent(s.id!)}>Delete</button>
+            </td>
+          </tr>)}
+          {students.length===0 && <tr><td colSpan={8} className="notice">No students.</td></tr>}
+        </tbody>
+      </table>
+    </div>
   </div>
 }
 
@@ -763,7 +819,6 @@ function SettingsView({
   return <div>
     <div style={{fontWeight:700, marginBottom:8}}>Device Controls</div>
     <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
-      <button className="btn" onClick={()=>sendSerialCommand('SCAN')} disabled={!connected}>SCAN</button>
       <button className="btn" onClick={()=>sendSerialCommand('SMS ON')} disabled={!connected}>SMS ON</button>
       <button className="btn" onClick={()=>sendSerialCommand('SMS OFF')} disabled={!connected}>SMS OFF</button>
       <button className="btn" onClick={()=>sendSerialCommand('AUTO ON 180')} disabled={!connected}>AUTO ON (180m)</button>
