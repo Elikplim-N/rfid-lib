@@ -6,6 +6,7 @@ import {
 } from './lib/db'
 import { requestPort, readLines } from './lib/serial'
 import { upsertTransactions, isSupabaseConfigured } from './lib/supabase'
+import { seedInitialData } from './lib/demo'
 
 const BLUE = '#166FE5'
 const ORANGE = '#FF7A00'
@@ -83,12 +84,16 @@ export default function App(){
   const [loans, setLoans] = useState<Loan[]>([])
   const [alerts, setAlerts] = useState<Loan[]>([])
 
-  // === INIT: open DB & request persistence, hydrate lists ===
+  // === INIT: open DB & request persistence, seed demo data, hydrate lists ===
   useEffect(() => {
     (async () => {
       await openDB()
       const granted = await ensurePersistence()
       if (!granted) console.info('Persistent storage not granted — data may be evicted under low disk.')
+      
+      // Seed initial demo data
+      await seedInitialData()
+      
       setStudents(await db.students.orderBy('created_at').reverse().toArray())
       setTx(await db.transactions.orderBy('occurred_at').reverse().limit(500).toArray())
       refreshAlerts()
