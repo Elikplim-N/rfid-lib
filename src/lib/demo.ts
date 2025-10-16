@@ -2,6 +2,12 @@ import { db, Loan, Tx, addDays, Student } from './db';
 
 // This function will be called once on app startup to ensure there's some data.
 export async function seedInitialData() {
+
+    // Clear existing data
+    await db.transactions.clear();
+    await db.students.clear();
+    await db.loans.clear();
+
     console.log("Seeding initial database data...");
 
     // Create a few students
