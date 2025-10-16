@@ -13,9 +13,9 @@ export async function seedInitialData() {
 
     // Create a few students
     const studentsToCreate: Student[] = [
-        { index_number: 'STU-001', full_name: 'Alice Johnson', program: 'Computer Science', level: '300', phone: '555-0101', card_uid: 'CARD-ALICE', created_at: new Date().toISOString() },
-        { index_number: 'STU-002', full_name: 'Bob Williams', program: 'Engineering', level: '200', phone: '555-0102', card_uid: 'CARD-BOB', created_at: new Date().toISOString() },
-        { index_number: 'STU-003', full_name: 'Charlie Brown', program: 'Art', level: '100', phone: '555-0103', card_uid: 'CARD-CHARLIE', created_at: new Date().toISOString() },
+        { index_number: '41254789', full_name: 'Alice Johnson', program: 'Computer Science', level: '300', phone: '555-0101', card_uid: 'CARD-ALICE', created_at: new Date().toISOString() },
+        { index_number: '12458002', full_name: 'Bob Williams', program: 'Computer Engineering', level: '200', phone: '555-0102', card_uid: 'CARD-BOB', created_at: new Date().toISOString() },
+        { index_number: '12147003', full_name: 'Charlie Brown', program: 'Mathematics', level: '100', phone: '555-0103', card_uid: 'CARD-CHARLIE', created_at: new Date().toISOString() },
     ];
     await db.students.bulkAdd(studentsToCreate);
 
