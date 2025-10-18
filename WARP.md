@@ -13,6 +13,11 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 ### TypeScript
 - Use `npx tsc --noEmit` to check TypeScript without building
 
+### Development Notes
+- No linting or testing framework configured - TypeScript compiler provides type checking
+- Environment variables are in `src/.env` (not root-level `.env`)
+- Demo mode is enabled by default for development without hardware
+
 ## Architecture Overview
 
 This is an **offline-first** RFID Library Manager web application built with React + TypeScript + Vite. The architecture follows these key patterns:
@@ -43,11 +48,12 @@ This is an **offline-first** RFID Library Manager web application built with Rea
 
 ## Configuration
 
-### Environment Variables (.env)
+### Environment Variables (src/.env)
 - `VITE_SUPABASE_URL` - Optional Supabase project URL
 - `VITE_SUPABASE_ANON_KEY` - Optional Supabase anon key  
 - `VITE_ADMIN_USER` - Admin username (default: admin)
 - `VITE_ADMIN_PASS` - Admin password (default: admin)
+- **Note**: Environment file is located in `src/.env`, not root `.env`
 
 ### Hardware Requirements
 - Chromium-based browser for Web Serial API
@@ -56,12 +62,14 @@ This is an **offline-first** RFID Library Manager web application built with Rea
 ## Code Guidelines
 
 ### File Organization
-- `/src/App.tsx` - Main application component and routing
-- `/src/lib/db.ts` - Database schema and operations
-- `/src/lib/serial.ts` - Hardware communication
+- `/src/App.tsx` - Main application component with hash-based routing
+- `/src/main.tsx` - Application entry point
+- `/src/lib/db.ts` - Database schema and operations (Dexie ORM)
+- `/src/lib/serial.ts` - Hardware communication via Web Serial API
 - `/src/lib/supabase.ts` - Cloud sync functionality
 - `/src/lib/demo.ts` - Demo data seeding
 - `/src/styles.css` - All styling (no CSS modules)
+- `/src/.env` - Environment variables (note: not in project root)
 
 ### Data Flow
 - All database operations go through Dexie
@@ -77,10 +85,11 @@ This is an **offline-first** RFID Library Manager web application built with Rea
 ## Development Notes
 
 ### Database Schema
-The app uses a 3-table structure with versioned migrations:
-- **students**: User profiles with card UIDs
-- **loans**: Active/returned item borrowings  
-- **transactions**: Immutable audit log
+The app uses a 3-table structure with versioned migrations (Dexie v1 → v2):
+- **students**: User profiles with card UIDs (`++id, index_number, card_uid, created_at`)
+- **loans**: Active/returned item borrowings (`id, status, due_at, student_index, user_uid, item_tag`)
+- **transactions**: Immutable audit log (`id, synced, occurred_at, action`)
+- **Migration**: v2 added `loans` table and `action` index to transactions
 
 ### Offline Capabilities
 - Full CRUD operations work offline
@@ -89,11 +98,18 @@ The app uses a 3-table structure with versioned migrations:
 - Export/import for data portability
 
 ### Hardware Protocol
-RFID reader firmware should send:
+RFID reader firmware should send via 115200 baud serial:
 ```
 CARD_SCANNED:E0A1B2C3
-STATUS|SMS:ON|Students:5|ActiveBorrows:3|...
+STATUS|SMS:ON|Students:5|ActiveBorrows:3|QueuePending:0|Auto:OFF|IntervalMin:0
+SCAN_ARMED
+SCAN_DONE
 ```
+
+**Serial Events Parsed**:
+- `CARD_SCANNED:` → `{event: 'card', uid: 'E0A1B2C3'}`
+- `STATUS|` → `{event: 'status', data: {...}}`
+- `SCAN_ARMED/SCAN_DONE` → `{event: 'scan', state: 'armed'|'done'}`
 
 ### Demo Mode
 The app auto-seeds with sample data including:
